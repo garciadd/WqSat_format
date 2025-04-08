@@ -1,12 +1,8 @@
-os
-yaml
-xml
+pyyaml
 rasterio
 numpy
 pyyaml
 matplotlib
-warnings
 rioxarray
 xarray
 scipy
-glob
