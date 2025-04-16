@@ -64,8 +64,15 @@ class S2Reader:
             return from_bounds(*bounds, transform=src.transform)
 
         elif self.roi_window:
+
+            # Use the provided pixel window
+            col_off = self.roi_window['xmin'] // factor
+            row_off = self.roi_window['ymin'] // factor
+            width = (self.roi_window['xmax'] - self.roi_window['xmin']) // factor
+            height = (self.roi_window['ymax'] - self.roi_window['ymin']) // factor
+            
             # Scale the window based on resolution factor
-            return Window(*(v // factor for v in self.roi_window))
+            return Window(col_off, row_off, width, height)
         
         return None
     
@@ -176,7 +183,7 @@ class S2Reader:
 
         file = os.path.basename(os.path.normpath(self.tile_path))
         file = file.split('.')[0]
-        
+
         for res, meta in metadata.items():
             output_file = os.path.join(self.tile_path, f"{file}_{res}m.tif")
 

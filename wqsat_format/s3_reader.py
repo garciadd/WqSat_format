@@ -5,23 +5,31 @@ import rioxarray
 import xarray as xr
 import rasterio
 from rasterio.control import GroundControlPoint
+from rasterio.windows import from_bounds, Window
+from rasterio.warp import calculate_default_transform, reproject, Resampling
+from rasterio.transform import from_gcps
+from rasterio.io import MemoryFile
 from scipy.interpolate import RectBivariateSpline
 
-from wqsat_format import s3_atcor
+from wqsat_format import atcor
 
 class S3Reader():
     """
     Class to read data from S3
     """
 
-    def __init__(self, tile_path, bands=None, roi_lat_lon=None, roi_window=None, atcor=True):
+    def __init__(self, tile_path, bands=None, roi_lat_lon=None, roi_window=None, atcor=True, output_format="GeoTIFF"):
         """
         Initialize the class with the bucket and key
         """
+
+        warnings.filterwarnings("ignore", category=UserWarning, module="rioxarray._io")
+
         self.tile_path = tile_path.rstrip('/') + '/'  # Evitar doble barra
         self.atcor = atcor
         self.roi_lat_lon = roi_lat_lon
         self.roi_window = roi_window
+        self.output_format = output_format
 
         if bands is None:
             bands = ['Oa01', 'Oa02', 'Oa03', 'Oa04', 'Oa05', 'Oa06', 'Oa07', 'Oa08', 'Oa09', 'Oa10', 
@@ -36,13 +44,13 @@ class S3Reader():
         lat = rioxarray.open_rasterio(f'netcdf:{self.tile_path}geo_coordinates.nc:latitude')
         lon = rioxarray.open_rasterio(f'netcdf:{self.tile_path}geo_coordinates.nc:longitude')
 
-        # Obtener scale_factor si existe
+        # get scale_factor
         lat_scale = getattr(lat, 'scale_factor', 1)
         lon_scale = getattr(lon, 'scale_factor', 1)
 
         lon_corrected = lon.data[0] * lon_scale
         lat_corrected = lat.data[0] * lat_scale
-
+            
         tr = rasterio.transform.from_bounds(
             west=np.min(lon_corrected), 
             south=np.min(lat_corrected),
@@ -52,25 +60,7 @@ class S3Reader():
             height=lat.y.size)
         
         return lat_corrected, lon_corrected, tr
-    
-    def get_window_crop(self):
-
-        xmin, xmax, ymin, ymax = self.roi_window
-        lat, lon, tr = self.get_tr()
-
-        lat_crop = lat[xmin:xmax, ymin:ymax]
-        lon_crop = lon[xmin:xmax, ymin:ymax]
-
-        tr = rasterio.transform.from_bounds(
-            west=np.min(lon_crop), 
-            south=np.min(lat_crop),
-            east=np.max(lon_crop), 
-            north=np.max(lat_crop),
-            width=lat.x.size, 
-            height=lat.y.size)
         
-        return lat_crop, lon_crop, tr
-    
     def get_SunAngles(self, width, height):
         """
         Read the Sun angles from S3
@@ -102,60 +92,86 @@ class S3Reader():
         Read the data from S3
         """
 
-        warnings.filterwarnings("ignore", category=rasterio.errors.NotGeoreferencedWarning)
+        valid_bands = [
+            file for file in os.listdir(self.tile_path)
+            if file.endswith('radiance.nc') and any(file.startswith(band) for band in self.bands)
+        ]
+
+        if not valid_bands:
+            raise ValueError("No valid bands found in the Sentinel-3 tile.")
+
+        # Ordenar valid_bands según el orden en self.bands
+        valid_bands.sort(key=lambda x: self.bands.index(next(band for band in self.bands if x.startswith(band))))
+
+        lat, lon, tr = self.get_tr()
         ds_list= []
+        for b in valid_bands:
 
+            # Read the data
+            banda = b.split('.')[0]
+            print(f"Reading band {banda}...")
+            A = rioxarray.open_rasterio(f'netcdf:{self.tile_path}{banda}.nc:{banda}')
+            arr = A.data[0]
+
+            if self.atcor:
+                # Apply ATCOR
+                scale_factor = getattr(A, 'scale_factor', 1)
+                sza, saa = self.get_SunAngles(A.sizes['x'], A.sizes['y'])                
+                arr = atcor.Atcor(arr, sza, saa, scale_factor).apply_all_corrections()
+
+            # Append the data to the list
+            ds_list.append(arr)
+
+        arr_bands = np.array(ds_list)
+        A = xr.DataArray(arr_bands, coords = [np.array(range(1,len(valid_bands)+1)), A.y.data, A.x.data], dims = A.dims)
+        A.rio.write_crs("EPSG:4326", inplace=True)
+        A.rio.write_transform(transform=tr, inplace=True)
+
+        nof_gcp_x = np.arange(0, A.x.size, 100)
+        nof_gcp_y = np.arange(0, A.y.size, 100)
+        gcps = []
+        id = 0
+        for x in nof_gcp_x:
+            for y in nof_gcp_y:        
+                gcps.append(GroundControlPoint(row=y, col=x, x=lon[y, x], y=lat[y, x], id=id))
+                id += 1
+
+        #tr_gcp = rasterio.transform.from_gcps(gcps)
+        A = A.rio.reproject(dst_crs="EPSG:4326", gcps=gcps, **{"SRC_METHOD": "GCP_TPS"})
+        
+        meta = {
+                "driver": "GTiff",
+                "dtype": str(A.dtype),
+                "nodata": A.rio.nodata,
+                "width": A.rio.width,
+                "height": A.rio.height,
+                "count": A.sizes.get("band", 1),
+                "crs": A.rio.crs,
+                "transform": A.rio.transform()
+            }
+        
+        # Recorte si se ha definido ROI
         if self.roi_lat_lon:
-            lat, lon, tr = self.get_window_crop()
-        return lat, lon, tr
+            A = A.rio.clip_box(
+                minx=self.roi_lat_lon['W'], miny=self.roi_lat_lon['S'],
+                maxx=self.roi_lat_lon['E'], maxy=self.roi_lat_lon['N']
+            )
 
-        # for b in bands:
+        elif self.roi_window:
+            
+            # Use the provided pixel window
+            col_off = self.roi_window['xmin']
+            row_off = self.roi_window['ymin']
+            width = (self.roi_window['xmax'] - self.roi_window['xmin'])
+            height = (self.roi_window['ymax'] - self.roi_window['ymin'])
+            
+            A = A.isel(x=slice(col_off, col_off + width),
+                       y=slice(row_off, row_off + height))
 
-        #     # Read the data
-        #     band = f'{b}_radiance'
-        #     ds = rioxarray.open_rasterio(f'netcdf:{self.tile_path}{band}.nc:{band}')
-        #     arr = ds.values.astype(np.uint16)
+        # Exportar GeoTIFF
+        file = os.path.basename(os.path.normpath(self.tile_path))
+        file = file.replace(".SEN3", ".tif")
+        output_file = os.path.join(self.tile_path, file)
 
-        #     if self.atcor:
-
-        #         # Apply ATCOR
-        #         scale_factor = getattr(ds, 'scale_factor', 1)
-        #         sza, saa = self.get_SunAngles(ds.sizes['x'], ds.sizes['y'])
-                
-        #         # Create AtcorSentinel3 object
-        #         arr = s3_atcor.AtcorSentinel3(arr, sza, saa, scale_factor).apply_all_corrections()
-
-        #     # Append the data to the list
-        #     ds_list.append(arr)
-
-        # arr_bands = np.squeeze(np.array(ds_list))
-
-        # ds = xr.DataArray(arr_bands, 
-        #                   coords = [np.array(range(1,22)), ds.y.data, ds.x.data], 
-        #                   dims = ('band', 'y', 'x'))
-    
-        # lat, lon, tr = self.get_tr()
-        # ds.rio.write_crs("EPSG:4326", inplace=True)
-        # ds.rio.write_transform(transform=tr, inplace=True)
-
-        # nof_gcp_x = np.arange(0, ds.x.size, 100)
-        # nof_gcp_y = np.arange(0, ds.y.size, 100)
-        # gcps = []
-        # id = 0
-
-        # for x in nof_gcp_x:
-        #     for y in nof_gcp_y:        
-        #         gcps.append(GroundControlPoint(
-        #             row=y, col=x, 
-        #             x=lon[y, x],
-        #             y=lat[y, x],
-        #             id=id))
-        #         id += 1
-
-        # tr_gcp = rasterio.transform.from_gcps(gcps)
-        # ds = ds.rio.reproject(dst_crs="EPSG:4326", transform=tr_gcp, gcps=gcps, **{"SRC_METHOD": "GCP_TPS"})
-
-        # file = self.tile.split('.')[0] + '.tif'
-        # output_file = os.path.join(self.tile_path, file)
-        # ds.rio.to_raster(output_file, recalc_transform=False)
-        # print('Tif of file {} saved'.format(self.tile_path))
+        A.rio.to_raster(output_file, recalc_transform=False)
+        print(f'Tif of file {self.tile_path} saved\n')
