@@ -5,10 +5,6 @@ import rioxarray
 import xarray as xr
 import rasterio
 from rasterio.control import GroundControlPoint
-from rasterio.windows import from_bounds, Window
-from rasterio.warp import calculate_default_transform, reproject, Resampling
-from rasterio.transform import from_gcps
-from rasterio.io import MemoryFile
 from scipy.interpolate import RectBivariateSpline
 
 from wqsat_format import atcor
@@ -33,7 +29,7 @@ class S3Reader():
 
         if bands is None:
             bands = ['Oa01', 'Oa02', 'Oa03', 'Oa04', 'Oa05', 'Oa06', 'Oa07', 'Oa08', 'Oa09', 'Oa10', 
-            'Oa11', 'Oa12', 'Oa13', 'Oa14', 'Oa15', 'Oa16', 'Oa17', 'Oa18', 'Oa19', 'Oa20', 'Oa21']
+                     'Oa11', 'Oa12', 'Oa13', 'Oa14', 'Oa15', 'Oa16', 'Oa17', 'Oa18', 'Oa19', 'Oa20', 'Oa21']
         self.bands = bands
 
     def get_tr(self):
@@ -44,13 +40,12 @@ class S3Reader():
         lat = rioxarray.open_rasterio(f'netcdf:{self.tile_path}geo_coordinates.nc:latitude')
         lon = rioxarray.open_rasterio(f'netcdf:{self.tile_path}geo_coordinates.nc:longitude')
 
-        # get scale_factor
         lat_scale = getattr(lat, 'scale_factor', 1)
         lon_scale = getattr(lon, 'scale_factor', 1)
 
         lon_corrected = lon.data[0] * lon_scale
         lat_corrected = lat.data[0] * lat_scale
-            
+
         tr = rasterio.transform.from_bounds(
             west=np.min(lon_corrected), 
             south=np.min(lat_corrected),
@@ -58,9 +53,9 @@ class S3Reader():
             north=np.max(lat_corrected),
             width=lat.x.size, 
             height=lat.y.size)
-        
+
         return lat_corrected, lon_corrected, tr
-        
+
     def get_SunAngles(self, width, height):
         """
         Read the Sun angles from S3
@@ -69,19 +64,15 @@ class S3Reader():
         file_path = os.path.join(self.tile_path, 'tie_geometries.nc')
         ds = xr.open_dataset(file_path)
 
-        # Extraer SZA y SAA
         sza = ds["SZA"].values
         saa = ds["SAA"].values
 
-        # Crear mallas de coordenadas originales
-        tie_x = np.linspace(0, width, sza.shape[1])  # Puntos de atadura en X
-        tie_y = np.linspace(0, height, sza.shape[0])  # Puntos de atadura en Y
+        tie_x = np.linspace(0, width, sza.shape[1])
+        tie_y = np.linspace(0, height, sza.shape[0])
 
-        # Crear mallas de destino a resolución completa
-        full_x = np.linspace(0, width, width)  # Resolución completa en X
-        full_y = np.linspace(0, height, height)  # Resolución completa en Y
+        full_x = np.linspace(0, width, width)
+        full_y = np.linspace(0, height, height)
 
-        # Interpolación bilineal
         sza_interp = RectBivariateSpline(tie_y, tie_x, sza)(full_y, full_x)
         saa_interp = RectBivariateSpline(tie_y, tie_x, saa)(full_y, full_x)
 
@@ -100,45 +91,40 @@ class S3Reader():
         if not valid_bands:
             raise ValueError("No valid bands found in the Sentinel-3 tile.")
 
-        # Ordenar valid_bands según el orden en self.bands
         valid_bands.sort(key=lambda x: self.bands.index(next(band for band in self.bands if x.startswith(band))))
 
         lat, lon, tr = self.get_tr()
-        ds_list= []
-        for b in valid_bands:
+        ds_list = []
 
-            # Read the data
+        for b in valid_bands:
             banda = b.split('.')[0]
             print(f"Reading band {banda}...")
             A = rioxarray.open_rasterio(f'netcdf:{self.tile_path}{banda}.nc:{banda}')
             arr = A.data[0]
 
             if self.atcor:
-                # Apply ATCOR
                 scale_factor = getattr(A, 'scale_factor', 1)
-                sza, saa = self.get_SunAngles(A.sizes['x'], A.sizes['y'])                
+                sza, saa = self.get_SunAngles(A.sizes['x'], A.sizes['y'])
                 arr = atcor.Atcor(arr, sza, saa, scale_factor).apply_all_corrections()
 
-            # Append the data to the list
             ds_list.append(arr)
 
         arr_bands = np.array(ds_list)
-        A = xr.DataArray(arr_bands, coords = [np.array(range(1,len(valid_bands)+1)), A.y.data, A.x.data], dims = A.dims)
+        A = xr.DataArray(arr_bands, coords=[np.array(range(1, len(valid_bands)+1)), A.y.data, A.x.data], dims=A.dims)
         A.rio.write_crs("EPSG:4326", inplace=True)
         A.rio.write_transform(transform=tr, inplace=True)
 
-        nof_gcp_x = np.arange(0, A.x.size, 100)
-        nof_gcp_y = np.arange(0, A.y.size, 100)
+        nof_gcp_x = np.arange(0, A.x.size, 25)
+        nof_gcp_y = np.arange(0, A.y.size, 25)
         gcps = []
-        id = 0
         for x in nof_gcp_x:
             for y in nof_gcp_y:        
-                gcps.append(GroundControlPoint(row=y, col=x, x=lon[y, x], y=lat[y, x], id=id))
-                id += 1
+                gcps.append(GroundControlPoint(row=int(y), col=int(x), x=float(lon[y, x]), y=float(lat[y, x])))
 
-        #tr_gcp = rasterio.transform.from_gcps(gcps)
-        A = A.rio.reproject(dst_crs="EPSG:4326", gcps=gcps, **{"SRC_METHOD": "GCP_TPS"})
-        
+        tr_gcp = rasterio.transform.from_gcps(gcps)
+        A.rio.write_transform(tr_gcp, inplace=True)
+        # A = A.rio.reproject(dst_crs="EPSG:4326")
+
         meta = {
                 "driver": "GTiff",
                 "dtype": str(A.dtype),
@@ -149,8 +135,7 @@ class S3Reader():
                 "crs": A.rio.crs,
                 "transform": A.rio.transform()
             }
-        
-        # Recorte si se ha definido ROI
+
         if self.roi_lat_lon:
             A = A.rio.clip_box(
                 minx=self.roi_lat_lon['W'], miny=self.roi_lat_lon['S'],
@@ -158,13 +143,11 @@ class S3Reader():
             )
 
         elif self.roi_window:
-            
-            # Use the provided pixel window
             col_off = self.roi_window['xmin']
             row_off = self.roi_window['ymin']
             width = (self.roi_window['xmax'] - self.roi_window['xmin'])
             height = (self.roi_window['ymax'] - self.roi_window['ymin'])
-            
+
             A = A.isel(x=slice(col_off, col_off + width),
                        y=slice(row_off, row_off + height))
 
@@ -173,5 +156,5 @@ class S3Reader():
         file = file.replace(".SEN3", ".tif")
         output_file = os.path.join(self.tile_path, file)
 
-        A.rio.to_raster(output_file, recalc_transform=False)
+        A.rio.to_raster(output_file, recalc_transform=True)
         print(f'Tif of file {self.tile_path} saved\n')
