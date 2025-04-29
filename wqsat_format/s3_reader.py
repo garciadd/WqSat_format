@@ -125,36 +125,73 @@ class S3Reader():
         A.rio.write_transform(tr_gcp, inplace=True)
         # A = A.rio.reproject(dst_crs="EPSG:4326")
 
-        meta = {
-                "driver": "GTiff",
-                "dtype": str(A.dtype),
-                "nodata": A.rio.nodata,
-                "width": A.rio.width,
-                "height": A.rio.height,
-                "count": A.sizes.get("band", 1),
-                "crs": A.rio.crs,
-                "transform": A.rio.transform()
-            }
-
+        # Recorte de bandas si aplica ROI
         if self.roi_lat_lon:
-            A = A.rio.clip_box(
+            A_clip = A.rio.clip_box(
                 minx=self.roi_lat_lon['W'], miny=self.roi_lat_lon['S'],
                 maxx=self.roi_lat_lon['E'], maxy=self.roi_lat_lon['N']
             )
+            y_idx = np.where((A.y >= A_clip.y.min()) & (A.y <= A_clip.y.max()))[0]
+            x_idx = np.where((A.x >= A_clip.x.min()) & (A.x <= A_clip.x.max()))[0]
+            arr_bands = arr_bands[:, y_idx[0]:y_idx[-1]+1, x_idx[0]:x_idx[-1]+1]
+            A = A_clip
 
         elif self.roi_window:
             col_off = self.roi_window['xmin']
             row_off = self.roi_window['ymin']
-            width = (self.roi_window['xmax'] - self.roi_window['xmin'])
-            height = (self.roi_window['ymax'] - self.roi_window['ymin'])
+            width = self.roi_window['xmax'] - self.roi_window['xmin']
+            height = self.roi_window['ymax'] - self.roi_window['ymin']
+            arr_bands = arr_bands[:, row_off:row_off + height, col_off:col_off + width]
+            A = A.isel(x=slice(col_off, col_off + width), y=slice(row_off, row_off + height))
 
-            A = A.isel(x=slice(col_off, col_off + width),
-                       y=slice(row_off, row_off + height))
+        meta = {
+            "bands": arr_bands.shape[0],
+            "height": arr_bands.shape[1],
+            "width": arr_bands.shape[2],
+            "transform": A.rio.transform(),
+            "crs": A.rio.crs
+        }
 
-        # Exportar GeoTIFF
-        file = os.path.basename(os.path.normpath(self.tile_path))
-        file = file.replace(".SEN3", ".tif")
-        output_file = os.path.join(self.tile_path, file)
+        self.export_data(arr_bands, meta)
 
-        A.rio.to_raster(output_file, recalc_transform=True)
-        print(f'Tif of file {self.tile_path} saved\n')
+    def export_data(self, arr_bands, meta):
+
+        file = os.path.basename(os.path.normpath(self.tile_path)).split('.')[0]
+        ext = "tif" if self.output_format.lower() == "geotiff" else "nc"
+        output_file = os.path.join(self.tile_path, f"{file}.{ext}")
+
+        if self.output_format.lower() == "geotiff":
+            meta.update({
+                "count": meta["bands"],
+                "dtype": np.float32,
+                "driver": "GTiff",
+            })
+
+            with rasterio.open(output_file, "w", **meta) as dst:
+                for i in range(meta["bands"]):
+                    dst.write(arr_bands[i].astype(np.float32), i + 1)
+
+        elif self.output_format.lower() == "netcdf":
+            data_vars = {
+                f"band_{i+1}": (("y", "x"), arr_bands[i]) for i in range(arr_bands.shape[0])
+            }
+
+            ds = xr.Dataset(
+                data_vars=data_vars,
+                coords={
+                    "y": np.arange(meta["height"]),
+                    "x": np.arange(meta["width"])
+                }
+            )
+            ds.to_netcdf(output_file)
+
+        else:
+            raise ValueError("Unsupported output format. Use 'GeoTIFF' or 'NetCDF'.")
+
+        # # Exportar GeoTIFF
+        # file = os.path.basename(os.path.normpath(self.tile_path))
+        # file = file.replace(".SEN3", ".tif")
+        # output_file = os.path.join(self.tile_path, file)
+
+        # A.rio.to_raster(output_file, recalc_transform=True)
+        # print(f'Tif of file {self.tile_path} saved\n')
