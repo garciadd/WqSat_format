@@ -10,5 +10,4 @@ setup(
     description='A Python package for processing Sentinel-2 and Sentinel-3 images.',
     author='CSIC',
     license='Apache License 2.0',
-    install_requires=reqs,
-    pbr=True)
+    install_requires=reqs)
