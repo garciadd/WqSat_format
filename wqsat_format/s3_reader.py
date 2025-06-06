@@ -26,10 +26,6 @@ class S3Reader():
         self.roi_lat_lon = roi_lat_lon
         self.roi_window = roi_window
         self.output_format = output_format
-
-        if bands is None:
-            bands = ['Oa01', 'Oa02', 'Oa03', 'Oa04', 'Oa05', 'Oa06', 'Oa07', 'Oa08', 'Oa09', 'Oa10', 
-                     'Oa11', 'Oa12', 'Oa13', 'Oa14', 'Oa15', 'Oa16', 'Oa17', 'Oa18', 'Oa19', 'Oa20', 'Oa21']
         self.bands = bands
 
     def get_tr(self):
@@ -110,20 +106,62 @@ class S3Reader():
             ds_list.append(arr)
 
         arr_bands = np.array(ds_list)
-        A = xr.DataArray(arr_bands, coords=[np.array(range(1, len(valid_bands)+1)), A.y.data, A.x.data], dims=A.dims)
+        A = xr.DataArray(
+            arr_bands,
+            coords=[np.arange(len(valid_bands)), np.arange(lat.shape[0]), np.arange(lat.shape[1])],
+            dims=("band", "y", "x"))
         A.rio.write_crs("EPSG:4326", inplace=True)
-        A.rio.write_transform(transform=tr, inplace=True)
 
-        nof_gcp_x = np.arange(0, A.x.size, 25)
-        nof_gcp_y = np.arange(0, A.y.size, 25)
+        # Escribimos GCPs
         gcps = []
-        for x in nof_gcp_x:
-            for y in nof_gcp_y:        
-                gcps.append(GroundControlPoint(row=int(y), col=int(x), x=float(lon[y, x]), y=float(lat[y, x])))
+        for x in range(0, lat.shape[1], 25):
+            for y in range(0, lat.shape[0], 25):
+                gcps.append(GroundControlPoint(row=y, col=x, x=lon[y, x], y=lat[y, x], z=0.0))
 
-        tr_gcp = rasterio.transform.from_gcps(gcps)
-        A.rio.write_transform(tr_gcp, inplace=True)
+        A.rio.write_crs("EPSG:4326", inplace=True)
+        A.rio.write_gcps(gcps, "EPSG:4326", inplace=True)
+        A = A.rio.reproject("EPSG:4326")
+
+        # A = xr.DataArray(arr_bands, coords=[np.array(range(1, len(valid_bands)+1)), A.y.data, A.x.data], dims=A.dims)
+        # # A.rio.write_crs("EPSG:4326", inplace=True)
+        # # A.rio.write_transform(transform=tr, inplace=True)
+
+        # nof_gcp_x = np.arange(0, A.x.size, 25)
+        # nof_gcp_y = np.arange(0, A.y.size, 25)
+        # gcps = []
+        # for x in nof_gcp_x:
+        #     for y in nof_gcp_y:        
+        #         gcps.append(GroundControlPoint(row=int(y), col=int(x), x=float(lon[y, x]), y=float(lat[y, x]), z=0.0))
+
+        # tr_gcp = rasterio.transform.from_gcps(gcps)
+        # A.rio.write_crs("EPSG:4326", inplace=True)
+        # A.rio.write_transform(tr_gcp, inplace=True)
+
+        # # Finalmente, reproyectamos (esto interpolará a una grilla regular en EPSG:4326)
         # A = A.rio.reproject(dst_crs="EPSG:4326")
+        # A.rio.write_transform(tr_gcp)
+        # A = A.rio.reproject(dst_crs="EPSG:4326")
+        # A = A.rio.reproject(dst_crs="EPSG:4326", gcps=gcps, **{"SRC_METHOD": "GCP_TPS"})
+
+        print("📌 Imagen reproyectada:")
+        print(f" - Lon min: {A.x.min().item():.6f}")
+        print(f" - Lon max: {A.x.max().item():.6f}")
+        print(f" - Lat min: {A.y.min().item():.6f}")
+        print(f" - Lat max: {A.y.max().item():.6f}")
+
+        print("📌 ROI solicitado:")
+        print(f" - Lon W (minx): {self.roi_lat_lon['W']}")
+        print(f" - Lon E (maxx): {self.roi_lat_lon['E']}")
+        print(f" - Lat S (miny): {self.roi_lat_lon['S']}")
+        print(f" - Lat N (maxy): {self.roi_lat_lon['N']}")
+
+        # Extra: comprueba si hay intersección
+        roi = self.roi_lat_lon
+        intersecta = not (
+            roi["E"] < A.x.min() or roi["W"] > A.x.max() or
+            roi["N"] < A.y.min() or roi["S"] > A.y.max()
+        )
+        print(f"❓¿ROI intersecta imagen?: {'✅ Sí' if intersecta else '❌ No'}")
 
         # Recorte de bandas si aplica ROI
         if self.roi_lat_lon:
@@ -145,53 +183,12 @@ class S3Reader():
             A = A.isel(x=slice(col_off, col_off + width), y=slice(row_off, row_off + height))
 
         meta = {
-            "bands": arr_bands.shape[0],
+            "bands": valid_bands,
             "height": arr_bands.shape[1],
             "width": arr_bands.shape[2],
             "transform": A.rio.transform(),
             "crs": A.rio.crs
         }
 
-        self.export_data(arr_bands, meta)
-
-    def export_data(self, arr_bands, meta):
-
-        file = os.path.basename(os.path.normpath(self.tile_path)).split('.')[0]
-        ext = "tif" if self.output_format.lower() == "geotiff" else "nc"
-        output_file = os.path.join(self.tile_path, f"{file}.{ext}")
-
-        if self.output_format.lower() == "geotiff":
-            meta.update({
-                "count": meta["bands"],
-                "dtype": np.float32,
-                "driver": "GTiff",
-            })
-
-            with rasterio.open(output_file, "w", **meta) as dst:
-                for i in range(meta["bands"]):
-                    dst.write(arr_bands[i].astype(np.float32), i + 1)
-
-        elif self.output_format.lower() == "netcdf":
-            data_vars = {
-                f"band_{i+1}": (("y", "x"), arr_bands[i]) for i in range(arr_bands.shape[0])
-            }
-
-            ds = xr.Dataset(
-                data_vars=data_vars,
-                coords={
-                    "y": np.arange(meta["height"]),
-                    "x": np.arange(meta["width"])
-                }
-            )
-            ds.to_netcdf(output_file)
-
-        else:
-            raise ValueError("Unsupported output format. Use 'GeoTIFF' or 'NetCDF'.")
-
-        # # Exportar GeoTIFF
-        # file = os.path.basename(os.path.normpath(self.tile_path))
-        # file = file.replace(".SEN3", ".tif")
-        # output_file = os.path.join(self.tile_path, file)
-
-        # A.rio.to_raster(output_file, recalc_transform=True)
-        # print(f'Tif of file {self.tile_path} saved\n')
+        filename = os.path.basename(os.path.normpath(self.tile_path)).split('.')[0]
+        return arr_bands, meta, filename

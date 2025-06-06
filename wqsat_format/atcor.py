@@ -1,4 +1,6 @@
+import os
 import numpy as np
+import xml.etree.ElementTree as ET
 
 class Atcor:
     def __init__(self, arr_band, sun_zenith, sun_azimuth, scale_factor=0.00001):

@@ -1,91 +1,17 @@
 import os
 import yaml
-import xml.etree.ElementTree as ET
 import numpy as np
 import rasterio
+import xarray as xr
 
 def base_dir():
     """Returns the base directory where config.yaml is stored."""
     return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-def config_path():
-    """Returns the full path of the config.yaml file."""
-    return os.path.join(base_dir(), 'config.yaml')
-
 def regions_path():
     """Returns the full path of the regions.yaml file."""
     return os.path.join(base_dir(), 'regions.yaml')
-
-def load_data_path():
-    """
-    Loads and returns the data path from the config.yaml file. Creates the directory if it doesn't exist.
-    Raises an error if the directory cannot be created.
-    """
-    try:
-        with open(config_path(), 'r') as file:
-            data = yaml.safe_load(file)
-            data_path = data.get('data_path', None)
-
-            # Ensure the directory exists
-            if data_path:
-                if not os.path.exists(data_path):
-                    try:
-                        os.makedirs(data_path)
-                        print(f"Directory '{data_path}' created.")
-                    except Exception as e:
-                        raise OSError(f"Failed to create the directory '{data_path}': {e}")
-
-            return data_path
-        
-    except FileNotFoundError:
-        print("Error: 'config.yaml' file not found.")
-        return None
-    except Exception as e:
-        raise RuntimeError(f"An unexpected error occurred: {e}")
     
-def read_sun_angle(safe_path):
-    """
-    Reads the MTD_TL.xml file from a Sentinel-2 image and returns the Sun Angle
-    
-    Parameters
-    ----------
-    safe_path : str
-        Path to the .SAFE directory of the Sentinel-2 image.
-    
-    Returns
-    -------
-    dict
-        Dictionary containing the image Sun Angle.
-    """
-    # Locate the MTD_TL.xml file inside the GRANULE subdirectory
-    granule_path = os.path.join(safe_path, "GRANULE")
-    if not os.path.exists(granule_path):
-        raise FileNotFoundError(f"Granule directory not found: {granule_path}")
-    
-    granule_dirs = [d for d in os.listdir(granule_path) if os.path.isdir(os.path.join(granule_path, d))]
-    if not granule_dirs:
-        raise FileNotFoundError("No granule subdirectory found inside GRANULE folder.")
-    
-    metadata_path = os.path.join(granule_path, granule_dirs[0], "MTD_TL.xml")
-    if not os.path.exists(metadata_path):
-        raise FileNotFoundError(f"Metadata file not found: {metadata_path}")
-    
-    # Parse the XML
-    tree = ET.parse(metadata_path)
-    root = tree.getroot()
-
-    SunAngle = {}
-    
-    # Extract solar angle from the correct file
-    sun_angle_node = root.find(".//Mean_Sun_Angle")
-    if sun_angle_node is not None:
-        SunAngle = {
-            "ZENITH_ANGLE": float(sun_angle_node.find("ZENITH_ANGLE").text),
-            "AZIMUTH_ANGLE": float(sun_angle_node.find("AZIMUTH_ANGLE").text)
-        }
-    
-    return SunAngle
-
 def adjust_contrast_and_scale(band, lower_percentile=2, upper_percentile=98):
     """
     Adjusts the contrast of a band by clipping extreme values 
@@ -132,53 +58,148 @@ def rgb_image(band_red, band_green, band_blue):
     rgb_image = np.stack((band_red_adjusted, band_green_adjusted, band_blue_adjusted), axis=-1)    
     return rgb_image
 
-def export_by_resolution(data_bands, metadata, output_dir):
-    """
-    Exports the data bands grouped by resolution to GeoTIFF format.
-    
-    Parameters:
-        data_bands (dict): A dictionary containing data for each resolution ('10', '20', '60').
-                           Each resolution contains a dictionary of bands.
-        metadata (dict): A dictionary containing metadata for each resolution.
-        output_dir (str): The directory where the exported files will be saved.
+def export_data(arr_bands, metadata, output_path, filename, output_format="GeoTIFF"):
 
-    Returns:
-        None
-    """
-    try:
-        # Create output directory if it doesn't exist
-        os.makedirs(output_dir, exist_ok=True)
-        
-        # Process each resolution
-        for resolution, bands_dict in data_bands.items():
-            output_file = os.path.join(output_dir, f"sentinel2_res_{resolution}m.tif")
-            
-            # Stack all bands into a 3D array (bands, height, width)
-            list_bands = sorted(bands_dict.keys())  # Ensure band order consistency
-            stacked_bands = np.stack([bands_dict[band] for band in list_bands], axis=0)
-
-            # Get metadata for this resolution
-            meta = metadata[resolution].copy()
+    if isinstance(arr_bands, dict):
+        for res, meta in metadata.items():
             meta.update({
-                "count": stacked_bands.shape[0],  # Number of bands
-                "dtype": stacked_bands.dtype,
-                "bands": list_bands
+                "count": len(meta["bands"]),
+                "dtype": np.float32
             })
+            if output_format.lower() == "geotiff":
+                output_file = os.path.join(output_path, f"{filename}_{res}m.tif")
+                meta.update({"driver": "GTiff"})
+                with rasterio.open(output_file, "w", **meta) as dst:
+                    for i, band in enumerate(meta["bands"], start=1):
+                        dst.write(arr_bands[res][band], i)
+                        dst.set_band_description(i, band)
 
-            # Write to GeoTIFF
-            with rasterio.open(output_file, 'w', driver='GTiff',
-                               height=stacked_bands.shape[1], width=stacked_bands.shape[2],
-                               count=stacked_bands.shape[0], dtype=stacked_bands.dtype,
-                               crs=meta["crs"], transform=meta["transform"]) as dst:
-                for band_idx in range(stacked_bands.shape[0]):
-                    dst.write(stacked_bands[band_idx, :, :], band_idx + 1)
+            elif output_format.lower() == "netcdf":
+                output_file = os.path.join(output_path, f"{filename}_{res}m.nc")
+                transform = meta["transform"]
+                height, width = meta["height"], meta["width"]
+                x_coords = np.array([transform * (col, 0) for col in range(width)])[:, 0]
+                y_coords = np.array([transform * (0, row) for row in range(height)])[:, 1]
+                data_vars = {band: (("y", "x"), arr_bands[res][band]) for band in meta["bands"]}
+                ds = xr.Dataset(
+                    data_vars=data_vars,
+                    coords={
+                        "x": ("x", x_coords),
+                        "y": ("y", y_coords)
+                    },
+                    attrs={
+                        "crs": meta["crs"],
+                        "transform": transform,
+                        "resolution": res,
+                        "description": f"Sentinel-2 data for {filename} at {res}m resolution",
+                        "date_range": f"{meta.get('start_date', 'unknown')} to {meta.get('end_date', 'unknown')}"
+                    }
+                )
+                ds.rio.write_crs(meta["crs"], inplace=True)
+                ds.to_netcdf(output_file)
+            else:
+                raise ValueError("Unsupported output format. Use 'GeoTIFF' or 'NetCDF'.")
+    else:
+        metadata.update({
+            "count": len(metadata["bands"]),
+            "dtype": np.float32
+        })
 
-            # Save metadata to a separate text file
-            metadata_file = os.path.join(output_dir, f"metadata_res_{resolution}m.txt")
-            with open(metadata_file, 'w') as f:
-                f.write(f"Metadata for resolution {resolution}m:\n")
-                for key, value in meta.items():
-                    f.write(f"{key}: {value}\n")
+        ext = "tif" if output_format.lower() == "geotiff" else "nc"
+        output_file = os.path.join(output_path, f"{filename}.{ext}")
 
-    except Exception as e:
-        raise RuntimeError(f"Error exporting bands: {e}")
+        if output_format.lower() == "geotiff":
+            metadata.update({"driver": "GTiff"})
+            with rasterio.open(output_file, "w", **metadata) as dst:
+                for i, band in enumerate(metadata["bands"], start=1):
+                    band_index = i-1
+                    dst.write(arr_bands[band_index], i)
+                    dst.set_band_description(i, band)
+        
+        elif output_format.lower() == "netcdf":
+            data_vars = {band: (("y", "x"), arr_bands[band]) for band in metadata["bands"]}
+            transform = metadata["transform"]
+            height, width = metadata["height"], metadata["width"]
+            x_coords = np.array([transform * (col, 0) for col in range(width)])[:, 0]
+            y_coords = np.array([transform * (0, row) for row in range(height)])[:, 1]
+            ds = xr.Dataset(
+                data_vars=data_vars,
+                coords={
+                    "x": ("x", x_coords),
+                    "y": ("y", y_coords)
+                },
+                attrs={
+                    "crs": metadata["crs"],
+                    "transform": transform,
+                    "description": f"Sentinel-2 data for {filename}",
+                    "date_range": f"{metadata.get('start_date', 'unknown')} to {metadata.get('end_date', 'unknown')}"
+                }
+            )
+            ds.rio.write_crs(metadata["crs"], inplace=True)
+            ds.to_netcdf(output_file)
+        else:
+            raise ValueError("Unsupported output format. Use 'GeoTIFF' or 'NetCDF'.")
+    
+def validate_inputs(config):
+
+    required_fields = {
+        "satellite": str,
+        "tile_path": (str, list),
+        "bands": list,
+        "roi_lat_lon": (dict, type(None)),
+        "roi_window": (dict, type(None)),
+        "atcor": bool,
+        "temporal_composite": (str, type(None)),
+        "spatial_composite": bool
+    }
+
+    for key, expected_type in required_fields.items():
+        if key not in config:
+            raise ValueError(f"❌ Missing required config key: '{key}'")
+        if not isinstance(config[key], expected_type):
+            raise ValueError(f"❌ Invalid type for '{key}': expected {expected_type}, got {type(config[key])}")
+
+    valid_satellites = ["SENTINEL-2", "SENTINEL-3"]
+    satellite = config["satellite"]
+    if satellite not in valid_satellites:
+        raise ValueError(f"❌ Invalid satellite: {satellite}. Must be one of {valid_satellites}")
+
+    s2_bands = ['B01', 'B02', 'B03', 'B04', 'B05', 'B06', 
+                'B07', 'B08', 'B8A', 'B09', 'B11', 'B12']
+    s3_bands = ['Oa01', 'Oa02', 'Oa03', 'Oa04', 'Oa05', 'Oa06', 'Oa07',
+                'Oa08', 'Oa09', 'Oa10', 'Oa11', 'Oa12', 'Oa13', 'Oa14',
+                'Oa15', 'Oa16', 'Oa17', 'Oa18', 'Oa19', 'Oa20', 'Oa21']
+
+    allowed_bands = s2_bands if satellite == "SENTINEL-2" else s3_bands
+    if "bands" not in config or not config["bands"]:
+        config["bands"] = allowed_bands.copy()  # Default to all bands if not specified
+    for b in config["bands"]:
+        if b not in allowed_bands:
+            raise ValueError(f"❌ Invalid band '{b}' for {satellite}. Allowed bands: {allowed_bands}")
+
+    if config["roi_lat_lon"]:
+        if len(config["roi_lat_lon"]) != 4:
+            raise ValueError("❌ 'roi_lat_lon' must be a list of four values: [W, S, E, N]")
+        
+        W, S, E, N = config["roi_lat_lon"]['W'], config["roi_lat_lon"]['S'], config["roi_lat_lon"]['E'], config["roi_lat_lon"]['N']
+        if not (-180 <= W < E <= 180):
+            raise ValueError("❌ Invalid longitude bounds: must satisfy -180 ≤ W < E ≤ 180")
+        if not (-90 <= S < N <= 90):
+            raise ValueError("❌ Invalid latitude bounds: must satisfy -90 ≤ S < N ≤ 90")
+
+    if config["roi_window"]:
+        if len(config["roi_window"]) != 4:
+            raise ValueError("❌ 'roi_window' must be a list of four values: [xmin, ymin, xmax, ymax]")
+
+        xmin, xmax = config["roi_window"]['xmin'], config["roi_window"]['xmax']
+        ymin, ymax = config["roi_window"]['ymin'], config["roi_window"]['ymax']
+        if not (xmin < xmax and ymin < ymax):
+            raise ValueError("❌ 'roi_window' must satisfy: xmin < xmax and ymin < ymax")
+
+    if config["temporal_composite"] is not None:
+        valid_temporal = ["median", "max"]
+        if config["temporal_composite"] not in valid_temporal:
+            raise ValueError(f"❌ Invalid value for 'temporal_composite': {config['temporal_composite']}. "
+                            f"Allowed values are: {valid_temporal}")
+
+    return True

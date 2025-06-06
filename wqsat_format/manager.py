@@ -1,104 +1,101 @@
-import os, re
+import os
 
-from wqsat_format import s2_reader
-from wqsat_format import s3_reader
+# Wqsat Format
+from wqsat_format import s2_reader, s3_reader
+from wqsat_format import composite
+from wqsat_format import utils
 
-class SentinelWorkflowManager:
+class FormatManager:
     """
     Class to manage Sentinel-2 and Sentinel-3 data processing.
     """
-
-    def __init__(self, tile_path, bands=None, roi_lat_lon=None, roi_window=None, atcor=True, 
-                 temporal_composite=None, spatial_composite=False, output_format="GeoTIFF"):
-        """
-        Initializes the Sentinel Workflow Manager.
-
-        Parameters
-        ----------
-        tile_path : str
-            Path to the Sentinel tile folder.
-        bands : list of str, optional
-            List of bands to read. If None, all bands are read.
-        roi_lat_lon : dict, optional
-            Dictionary with bounding box (W, N, E, S) in latitude/longitude.
-        roi_window : list of int, optional
-            List defining the window in pixels (xmin, ymin, xmax, ymax).
-        atcor : bool, optional
-            Whether to apply atmospheric correction (Dark object subtraction, DOS).
-        crs : str, optional
-            Coordinate reference system of input coordinates.
-        output_format : str, optional
-            Output format for the exported data. Default is "GeoTIFF".
-        """
-        self.tile_path = tile_path
-        self.bands = bands
-        self.roi_lat_lon = roi_lat_lon
-        self.roi_window = roi_window
-        self.atcor = atcor
-        self.temporal_composite = temporal_composite
-        self.spatial_composite = spatial_composite
-        self.output_format = output_format
-
-    def select_reader(self, path):
-        """
-        Selects the appropriate reader based on the tile path.
-
-        Returns
-        -------
-        object
-            An instance of the selected reader class.
-        """
-        tile_name = os.path.basename(path)
-        if tile_name.startswith("S2"):
-            return s2_reader.S2Reader(tile_path=self.tile_path, 
-                                      bands=self.bands, 
-                                      roi_lat_lon=self.roi_lat_lon, 
-                                      roi_window=self.roi_window, 
-                                      atcor=self.atcor, 
-                                      temporal_composite=self.temporal_composite,
-                                      output_format=self.output_format)
-        elif tile_name.startswith("S3"):
-            return s3_reader.S3Reader(tile_path=self.tile_path, 
-                                      bands=self.bands, 
-                                      roi_lat_lon=self.roi_lat_lon, 
-                                      roi_window=self.roi_window, 
-                                      atcor=self.atcor, 
-                                      temporal_composite=self.temporal_composite,
-                                      output_format=self.output_format)
+    def __init__(self, config: dict = None, config_file: str = None):
+        if config:
+            self.config = config
+        elif config_file:
+            self.config = self.from_yaml(config_file)
         else:
-            raise ValueError("Unsupported tile type. Please provide a valid Sentinel-2 or Sentinel-3 tile path.")
+            raise ValueError("Either config or config_path must be provided.")
         
-    def run(self):
+        self.settings = {
+            "satellite": self.config.get("satellite"),
+            "tile_path": self.config.get("tile_path"),
+            "bands": self.config.get("bands", []),
+            "roi_lat_lon": self.config.get("roi_lat_lon", None),
+            "roi_window": self.config.get("roi_window", None),
+            "atcor": self.config.get("atcor", False),
+            "temporal_composite": self.config.get("temporal_composite", None),
+            "spatial_composite": self.config.get("spatial_composite", False),
+            "output_dir": self.config.get("output_dir", '.'),
+            "output_format": self.config.get("output_format", "GeoTIFF")}
+        
+        ## Validate inputs
+        utils.validate_inputs(self.settings)
+        os.makedirs(self.settings['output_dir'], exist_ok=True)
+        
+    def workflow(self):
         """
         Runs the selected reader to process the data.
         """
-        if isinstance(self.tile_path, str):
+
+        if isinstance(self.settings['tile_path'], str):
             #Leer y exportar una sola tile
-            reader = self.select_reader(self.tile_path)
-            band_data, metadata = reader.read_bands()
-            reader.export_data(band_data, metadata)
+            if self.settings['satellite'] == "SENTINEL-2":
+                reader = s2_reader.S2Reader(tile_path= self.settings['tile_path'], bands=self.settings['bands'],
+                                            roi_lat_lon=self.settings['roi_lat_lon'], roi_window=self.settings['roi_window'],
+                                            atcor=self.settings['atcor'])
+            elif self.settings['satellite'] == "SENTINEL-3":
+                reader = s3_reader.S3Reader(tile_path=self.settings['tile_path'], bands=self.settings['bands'],
+                                            roi_lat_lon=self.settings['roi_lat_lon'], roi_window=self.settings['roi_window'],
+                                            atcor=self.settings['atcor'])
+            else:
+                raise ValueError("❌ Unsupported satellite type. Please use 'SENTINEL-2' or 'SENTINEL-3'.")
+                                            
+            # Read the bands and metadata
+            band_data, metadata, output_filename = reader.read_bands()
+            return band_data, metadata, output_filename
+            # utils.export_data(band_data, metadata, self.output_path, output_filename, self.settings['output_format'])
         
-        elif isinstance(self.tile_path, list):
-            if not self.tile_path:
-                raise ValueError("The list of tile paths is empty.")
+        elif isinstance(self.settings['tile_path'], list):
             
-            if self.temporal_composite is not None:
-                prefixes = {os.path.basename(p)[:2] for p in self.tile_path}
-                if len(prefixes) > 1:
-                    raise ValueError("Temporal composite only supports tiles from the same satellite type (S2 or S3).")
-                print("Composing temporal tiles...")
-                reader = self.select_reader(self.tile_path[0])
-                reader.compose_temporal_tiles(self.tile_path)
+            if not self.settings['tile_path']:
+                raise ValueError("❌ The list of tile paths is empty.")
             
-            elif self.spatial_composite:
-                print("Composing spatial tiles...")
-                reader = self.select_reader(self.tile_path[0])
-                reader.compose_spatial_tiles(self.tile_path)
+            if self.settings['satellite'] != "SENTINEL-2":
+                raise ValueError("❌ Temporal and spatial composites are only available for Sentinel-2.")
+            
+            # Composing temporal or spatial tiles
+            if self.settings['temporal_composite'] and self.settings['spatial_composite']:  
+                raise ValueError("❌ Both temporal and spatial composites cannot be applied simultaneously.")
+            
+            if self.settings['temporal_composite']:
+                if self.settings['temporal_composite'] not in ["median", "max"]:
+                    raise ValueError("❌ Invalid composite type. Use 'median' or 'max'.")
+                
+                # Create a temporal composite            
+                reader = composite.CompositeManager(tile_path=self.settings['tile_path'], bands=self.settings['bands'],
+                                                    roi_lat_lon=self.settings['roi_lat_lon'], roi_window=self.settings['roi_window'],
+                                                    atcor=self.settings['atcor'], temporal_composite=self.settings['temporal_composite'])
+                composite_arr, composite_metadata, output_filename = reader.compose_temporal_tiles(self.settings['tile_path'])
+                return composite_arr, composite_metadata, output_filename
+                # utils.export_data(composite_arr, composite_metadata, self.output_path, output_filename)
+                    
+            elif self.settings['spatial_composite']:
+                reader = composite.CompositeManager(tile_path=self.settings['tile_path'], bands=self.settings['bands'],
+                                                    roi_lat_lon=self.settings['roi_lat_lon'], roi_window=self.settings['roi_window'],
+                                                    atcor=self.settings['atcor'])
+                
+                composite_arr, composite_metadata, output_filename = reader.compose_spatial_tiles(self.settings['tile_path'])
+                return composite_arr, composite_metadata, output_filename
+                # utils.export_data(composite_arr, composite_metadata, self.output_path, output_filename)
 
             else:
-                for path in self.tile_path:
-                    reader = self.select_reader(path)
-                    band_data, metadata = reader.read_bands()
-                    reader.export_data(band_data, metadata)
+                for tile_path in self.settings['tile_path']:
+                    print(f"Reading tile {tile_path}...")
+                    reader = s2_reader.S2Reader(tile_path=tile_path, bands=self.settings['bands'], roi_lat_lon=self.settings['roi_lat_lon'], 
+                                                roi_window=self.settings['roi_window'], atcor=self.settings['atcor'])
+                    band_data, metadata, output_filename = reader.read_bands()
+                    return band_data, metadata, output_filename
+                    # utils.export_data(band_data, metadata, self.output_path, output_filename)
         else:
-                raise ValueError("Invalid tile path. Please provide a string or a list of strings.")
+                raise ValueError("❌ Invalid 'tile path'. Please provide a string or a list of strings.")

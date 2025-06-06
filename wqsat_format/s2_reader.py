@@ -1,37 +1,48 @@
 import os, re
 import glob
-import numpy as np
-import xml.etree.ElementTree as ET
-from datetime import datetime
-from collections import defaultdict
-from typing import List
 import rasterio
+import xml.etree.ElementTree as ET
 from rasterio.windows import Window, from_bounds
-from rasterio.transform import array_bounds, from_origin
-import rasterio.merge
-from rasterio.warp import reproject, Resampling, calculate_default_transform, transform_bounds
-import xarray as xr
+from rasterio.warp import transform_bounds
 
 from wqsat_format import atcor
 
 class S2Reader:
-    def __init__(self, tile_path, bands=None, roi_lat_lon=None, roi_window=None, atcor=True, 
-                 temporal_composite=None, crs="EPSG:4326", output_format="GeoTIFF"):
+    def __init__(self, tile_path, bands=None, roi_lat_lon=None, roi_window=None, atcor=False, crs="EPSG:4326"):
+        """
+        Initializes the S2Reades class for reading Setinel-2 SAFE or GeoTIFF imagery.
 
+        Parameters
+        ----------
+        tile_path (str): Path to SAFE directory or GeoTIFF file.
+        bands (list of str, optional): List of bands to read. If None, all bands are read.
+        roi_lat_lon (dict, optional): Geographic ROI. Dictionary with bounding box {W, N, E, S} in latitude/longitude.
+        roi_window (dict, optional): Pixel ROI. Dictionary defining the window in pixels {xmin, ymin, xmax, ymax}.
+        atcor (bool): Whether to apply atmospheric correction (Dark object subtraction, DOS).
+        crs (str): Coordinate reference system of input coordinates. Default is "EPSG:4326".
+        """ 
+        # Initialize reader with path to SAFE directory or GeoTIFF file
         self.tile_path = tile_path
+        if not os.path.exists(self.tile_path):
+            raise FileNotFoundError(f"Tile path does not exist: {self.tile_path}")
+        
         self.roi_lat_lon = roi_lat_lon
         self.roi_window = roi_window
         self.atcor = atcor
-        self.temporal_composite = temporal_composite
-        self.crs = crs
-        self.output_format = output_format
+        self.crs = crs        
+        self.bands = bands
         
-        # Default to all available bands if none are specified
-        self.bands = bands or ['B01', 'B02', 'B03', 'B04', 'B05', 'B06', 
-                               'B07', 'B08', 'B8A', 'B09', 'B11', 'B12']
-        
-    def calculate_window(self, src, resolution):
+    def get_window(self, src, resolution):
+        """
+        Compute rasterio Window object for cropping the image.
 
+        Parameters:
+        src (rasterio DatasetReader): Opened rasterio source.
+        resolution (int): Image resolution in meters.
+
+        Returns:
+        tuple: (rasterio.windows.Window, bounds) or (None, None) if no ROI.
+        """
         factor = int(resolution) // 10 # Adjust window size based on resolution factor
 
         if self.roi_lat_lon:
@@ -39,7 +50,7 @@ class S2Reader:
             W, N, E, S = self.roi_lat_lon['W'], self.roi_lat_lon['N'], self.roi_lat_lon['E'], self.roi_lat_lon['S']
             bounds = transform_bounds(self.crs, src.crs, float(W), float(S), float(E), float(N))
 
-            # Ajustar los bounds a los límites de la imagen
+            # Clip the requested bounds to the image bounds
             left, bottom, right, top = src.bounds
             new_bounds = (
                 max(bounds[0], left),
@@ -48,14 +59,13 @@ class S2Reader:
                 min(bounds[3], top)
             )
 
-            # Crear window a partir de bounds ajustados
+            # Convert clipped bounds to pixel window
             window = from_bounds(*new_bounds, transform=src.transform)
-
             return window, new_bounds
 
         elif self.roi_window:
 
-            # Use the provided pixel window
+            # Convert pixel coordinates with resolution scaling
             col_off = self.roi_window['xmin'] // factor
             row_off = self.roi_window['ymin'] // factor
             width = (self.roi_window['xmax'] - self.roi_window['xmin']) // factor
@@ -89,51 +99,69 @@ class S2Reader:
         # Extract solar angle from the correct file
         sun_angle_node = root.find(".//Mean_Sun_Angle")
         if sun_angle_node is not None:
-            sza =  float(sun_angle_node.find("ZENITH_ANGLE").text),
+            sza =  float(sun_angle_node.find("ZENITH_ANGLE").text)
             saa =  float(sun_angle_node.find("AZIMUTH_ANGLE").text)
     
         return sza, saa
 
-    def read_bands(self):
+    def read_safe(self):
+        """
+        Read Sentinel-2 imagery from SAFE format (.jp2) structure.
 
+        Returns:
+        dict: Band data grouped by resolution.
+        dict: Metadata for each resolution.
+        """
         try:
             # Locate the IMG_DATA folder within the Sentinel-2 tile structure
             granule_path = glob.glob(os.path.join(self.tile_path, "GRANULE", "*", "IMG_DATA"))[0]
-            jp2_files = {os.path.basename(f).split("_")[-1].split(".")[0]: f for f in glob.glob(os.path.join(granule_path, "*.jp2"))}
+            subdirs = [d for d in os.listdir(granule_path) if os.path.isdir(os.path.join(granule_path, d)) and d.startswith("R")]
+            if subdirs:
+                jp2_files_list = glob.glob(os.path.join(granule_path, "R*", "*.jp2"))
+            else:
+                jp2_files_list = glob.glob(os.path.join(granule_path, "*.jp2"))
+
+            jp2_files = {}
+            for f in jp2_files_list:
+                filename = os.path.basename(f)
+                match = re.search(r'_(B\d{2}|B8A|AOT|WVP|TCI|SCL)(?=\.jp2|_|$)', filename)
+                if match:
+                    band_id = match.group(1)
+                    jp2_files[band_id] = f
         except IndexError:
             raise ValueError("Granule path not found in the Sentinel-2 tile directory.")
         
         valid_bands = [b for b in self.bands if b in jp2_files]
-        valid_bands.sort(key=lambda x: self.bands.index(next(b for b in self.bands if x.startswith(b))))
+        valid_bands.sort(key=lambda x: self.bands.index(x))
         if not valid_bands:
             raise ValueError("No valid bands found in the Sentinel-2 tile.")
         
         # Band groupings by resolution
         resolution_bands = {
-            "10": ["B04", "B03", "B02", "B08"],
-            "20": ["B05", "B06", "B07", "B8A", "B11", "B12"],
-            "60": ["B01", "B09", "B10"]
+            10: ["B04", "B03", "B02", "B08"],
+            20: ["B05", "B06", "B07", "B8A", "B11", "B12"],
+            60: ["B01", "B09", "B10"]
         }
 
         # Initialize dictionaries for data and metadata
         arr_bands, metadata = {}, {}
-        if self.atcor:
-            sza, saa = self.get_SunAngles()
-
         for res, bands in resolution_bands.items():
+            selected_bands = [band for band in bands if band in valid_bands]
+            if not selected_bands:
+                continue
+
             arr_bands[res] = {}
             bands_list = []
-            for band in bands:
-                if band not in valid_bands:
-                    continue
+            for band in selected_bands:
                 try:
                     print(f"Reading band {band} at {res}m resolution...")
                     with rasterio.open(jp2_files[band]) as src:
-                        window, new_bounds = self.calculate_window(src, int(res))
+                        window, new_bounds = self.get_window(src, int(res))
                         data = src.read(1, window=window)
 
                         if self.atcor:
                             # Apply ATCOR corrections
+                            sza, saa = self.get_SunAngles()
                             data = atcor.Atcor(data, sza, saa).apply_all_corrections()  
 
                         arr_bands[res][band] = data
@@ -152,174 +180,71 @@ class S2Reader:
                                 "count": len(bands_list),
                                 "dtype": data.dtype,
                                 "bands": bands_list,
-                                "bounds": new_bounds if new_bounds else src.bounds
+                                "bounds": new_bounds if new_bounds else src.bounds,
+                                "crs": src.crs,
+                                "transform_affine": list(src.transform)[:6],
+                                "resolution": src.transform[0],
                             })
                             metadata[res] = meta
                 except Exception as e:
-                    raise RuntimeError(f"Error reading band {band} at {res}m resolution: {e}")    
+                    raise RuntimeError(f"Error reading band {band} at {res}m resolution: {e}") 
         return arr_bands, metadata
-
-    def compose_temporal_tiles(self, tile_paths: list[str]):
-        if self.temporal_composite not in ["median", "max"]:
-            raise ValueError("Invalid composite type. Use 'median' or 'max'.")
-
-        grid_codes = {re.search(r"T\d{2}[A-Z]{3}", os.path.basename(path)).group() for path in tile_paths}
-        if len(grid_codes) != 1:
-            raise ValueError(f"Tiles do not share the same grid: {grid_codes}")
-
-        tile_data = []
-        for path in tile_paths:
-            print(f"Reading tile {os.path.basename(os.path.normpath(path))}...")
-            date_str = re.search(r"\d{8}T\d{6}", path).group()[:8]
-            date = datetime.strptime(date_str, "%Y%m%d")
-            self.tile_path = path
-            band_data, metadata = self.read_bands()
-            tile_data.append((date, band_data, metadata))
-
-        tile_data.sort(key=lambda x: x[0])
-        grouped_bands = defaultdict(lambda: defaultdict(list))
-
-        for date, band_data, _ in tile_data:
-            for res, bands in band_data.items():
-                for band, arr in bands.items():
-                    grouped_bands[res][band].append(arr)
-
-        final_composite = defaultdict(dict)
-        composite_metadata = {}
-
-        for res, band_group in grouped_bands.items():
-            for band, arr_list in band_group.items():
-                stack = np.stack(arr_list, axis=0)
-                if self.temporal_composite == "median":
-                    result = np.nanmedian(stack, axis=0)
-                else:
-                    result = np.nanmax(stack, axis=0)
-                final_composite[res][band] = result.astype(np.float32)
-            _, _, metadata = tile_data[0]
-            composite_metadata[res] = {
-                'dtype': np.float32,
-                'count': len(band_group),
-                'crs': metadata[res]['crs'],
-                'transform': metadata[res]['transform'],
-                'height': metadata[res]['height'],
-                'width': metadata[res]['width'],
-                'bands': list(band_group.keys()),
-                'start_date': tile_data[0][0].strftime("%Y-%m-%d"),
-                'end_date': tile_data[-1][0].strftime("%Y-%m-%d")
-            }
-
-        first_date = tile_data[0][0].strftime("%Y%m%d")
-        last_date = tile_data[-1][0].strftime("%Y%m%d")
-        grid = next(iter(grid_codes))
-        prefix = f"{self.temporal_composite.capitalize()}_temporal_composite_{grid}_{first_date}_{last_date}"
-        self.tile_path = os.path.commonpath(tile_paths)
-        self.export_data(final_composite, composite_metadata, prefix)
     
-    def compose_spatial_tiles(self, tile_paths: list[str]):
-        if len(tile_paths) < 2:
-            raise ValueError("At least two tile paths are required for spatial composition.")
-        grid_codes = {re.search(r"T\d{2}[A-Z]{3}", os.path.basename(path)).group() for path in tile_paths}
-        date_codes = sorted([re.search(r"\d{8}T\d{6}", os.path.basename(path)).group()[:8] for path in tile_paths])
-        all_data = defaultdict(lambda: defaultdict(list))
-        bounds_list = []
-        src_crs = None
-        resolutions = {}
-        for path in tile_paths:
-            self.tile_path = path
-            print(f"Reading tile {os.path.basename(os.path.normpath(self.tile_path))}...")
-            bands_data, metadata = self.read_bands()
-            for res, bands in bands_data.items():
-                for band, data in bands.items():
-                    all_data[res][band].append((data, metadata[res]['transform'], metadata[res]['crs']))
-                    if src_crs is None:
-                        src_crs = metadata[res]['crs']
-                if res in metadata:
-                    bounds = array_bounds(
-                        metadata[res]['height'], metadata[res]['width'], metadata[res]['transform']
-                    )
-                    bounds_list.append(bounds)
-                    resolutions[res] = metadata[res]['transform'][0]
-        minxs, minys, maxxs, maxys = zip(*bounds_list)
-        global_bounds = (min(minxs), min(minys), max(maxxs), max(maxys))
-        final_composite = defaultdict(dict)
-        composite_metadata = {}
-        for res, bands in all_data.items():
-            pixel_size = resolutions[res]
-            dst_width = int((global_bounds[2] - global_bounds[0]) / pixel_size)
-            dst_height = int((global_bounds[3] - global_bounds[1]) / pixel_size)
-            dst_transform = from_origin(global_bounds[0], global_bounds[3], pixel_size, pixel_size)
-            for band, datasets in bands.items():
-                common_canvas = np.full((dst_height, dst_width), np.nan, dtype=np.float32)
-                for data, transform, src_crs_band in datasets:
-                    tmp_canvas = np.full((dst_height, dst_width), np.nan, dtype=np.float32)
-                    reproject(
-                        source=data,
-                        destination=tmp_canvas,
-                        src_transform=transform,
-                        src_crs=src_crs_band,
-                        dst_transform=dst_transform,
-                        dst_crs=src_crs,
-                        resampling=Resampling.nearest,
-                        src_nodata=None,
-                        dst_nodata=np.nan,
-                        init_dest_nodata=True
-                    )
-                    mask = ~np.isnan(tmp_canvas)
-                    common_canvas[mask] = np.where(np.isnan(common_canvas[mask]), tmp_canvas[mask],
-                                                   np.maximum(common_canvas[mask], tmp_canvas[mask]))
-                final_composite[res][band] = common_canvas.astype(np.float32)
-            composite_metadata[res] = {
-                'dtype': np.float32,
-                'count': len(bands),
-                'crs': src_crs,
-                'transform': dst_transform,
-                'height': dst_height,
-                'width': dst_width,
-                'bands': list(bands.keys()),
-                'start_date': date_codes[0],
-                'end_date': date_codes[-1]
-            }
-        first_date = date_codes[0]
-        last_date = date_codes[-1]
-        prefix = f"Spatial_composite_{'_'.join(sorted(grid_codes))}_{first_date}_{last_date}"
-        self.tile_path = os.path.commonpath(tile_paths)
-        self.export_data(final_composite, composite_metadata, prefix)
+    def read_geotiff(self):
+        """
+        Read bands from a single GeoTIFF file using ROI and descriptions.
 
-    def export_data(self, arr_bands, metadata, prefix=None):
-        file = prefix if prefix else os.path.basename(os.path.normpath(self.tile_path)).split('.')[0]
-        for res, meta in metadata.items():
-            output_file = os.path.join(self.tile_path, f"{file}_{res}m.{self.output_format.lower()}")
+        Returns:
+        dict: Band data grouped by resolution.
+        dict: Metadata for the resolution.
+        """
+        arr_bands, metadata = {}, {}
+        with rasterio.open(self.tile_path) as src:
+            res = int(src.transform[0])
+            window, new_bounds = self.get_window(src, res)
+
+            band_names = [src.descriptions[i] if src.descriptions[i] else f"Band_{i+1}" for i in range(src.count)]
+            available_bands = dict(zip(band_names, range(1, src.count + 1)))
+            bands_to_read = [b for b in self.bands if b in available_bands]
+            if not bands_to_read:
+                raise ValueError("No valid bands found in the GeoTIFF file.")
+            
+            arr_bands[str(res)] = {}
+            for band_name in bands_to_read:
+                band_index = available_bands[band_name]
+                data = src.read(band_index, window=window)
+                arr_bands[str(res)][band_name] = data
+            meta = src.meta.copy()
+            if window:
+                meta.update({
+                    "transform": src.window_transform(window),
+                    "width": data.shape[1],
+                    "height": data.shape[0]
+                })
             meta.update({
-                "count": len(meta["bands"]),
-                "dtype": np.float32
+                "crs": src.crs,
+                "bands": bands_to_read,
+                "resolution": src.transform[0],
+                "transform_affine": list(src.transform)[:6],
+                "bounds": new_bounds if new_bounds else src.bounds
             })
-            if self.output_format.lower() == "geotiff":
-                meta.update({"driver": "GTiff"})
-                with rasterio.open(output_file, "w", **meta) as dst:
-                    for i, band in enumerate(meta["bands"], start=1):
-                        dst.write(arr_bands[res][band], i)
-                        dst.set_band_description(i, band)
-            elif self.output_format.lower() == "netcdf":
-                transform = meta["transform"]
-                height, width = meta["height"], meta["width"]
-                x_coords = np.array([transform * (col, 0) for col in range(width)])[:, 0]
-                y_coords = np.array([transform * (0, row) for row in range(height)])[:, 1]
-                data_vars = {band: (("y", "x"), arr_bands[res][band]) for band in meta["bands"]}
-                ds = xr.Dataset(
-                    data_vars=data_vars,
-                    coords={
-                        "x": ("x", x_coords),
-                        "y": ("y", y_coords)
-                    },
-                    attrs={
-                        "crs": meta["crs"],
-                        "transform": transform,
-                        "resolution": res,
-                        "description": f"Sentinel-2 data for {file} at {res}m resolution",
-                        "date_range": f"{meta.get('start_date', 'unknown')} to {meta.get('end_date', 'unknown')}"
-                    }
-                )
-                ds.rio.write_crs(meta["crs"], inplace=True)
-                ds.to_netcdf(output_file)
-            else:
-                raise ValueError("Unsupported output format. Use 'GeoTIFF' or 'NetCDF'.")
+            metadata[str(res)] = meta
+        return arr_bands, metadata
+    
+    def read_bands(self):
+        """
+        Wrapper method to read bands from SAFE or GeoTIFF based on file type.
+
+        Returns:
+        dict: Band data grouped by resolution.
+        dict: Metadata.
+        """
+        if self.tile_path.endswith(".SAFE"):
+            band_data, metadata = self.read_safe()
+        elif self.tile_path.endswith(".tif") or self.tile_path.endswith(".tiff"):
+            band_data, metadata = self.read_geotiff()
+        else:
+            raise ValueError("Unsupported file format. Please provide a .SAFE or .tif file.")
+        
+        filename = os.path.basename(os.path.normpath(self.tile_path)).split('.')[0]
+        return band_data, metadata, filename
