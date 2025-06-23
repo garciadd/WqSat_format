@@ -37,7 +37,6 @@ class FormatManager:
         """
         Runs the selected reader to process the data.
         """
-
         if isinstance(self.settings['tile_path'], str):
             #Leer y exportar una sola tile
             if self.settings['satellite'] == "SENTINEL-2":
@@ -54,7 +53,6 @@ class FormatManager:
             # Read the bands and metadata
             band_data, metadata, output_filename = reader.read_bands()
             return band_data, metadata, output_filename
-            # utils.export_data(band_data, metadata, self.output_path, output_filename, self.settings['output_format'])
         
         elif isinstance(self.settings['tile_path'], list):
             
@@ -78,7 +76,6 @@ class FormatManager:
                                                     atcor=self.settings['atcor'], temporal_composite=self.settings['temporal_composite'])
                 composite_arr, composite_metadata, output_filename = reader.compose_temporal_tiles(self.settings['tile_path'])
                 return composite_arr, composite_metadata, output_filename
-                # utils.export_data(composite_arr, composite_metadata, self.output_path, output_filename)
                     
             elif self.settings['spatial_composite']:
                 reader = composite.CompositeManager(tile_path=self.settings['tile_path'], bands=self.settings['bands'],
@@ -87,15 +84,13 @@ class FormatManager:
                 
                 composite_arr, composite_metadata, output_filename = reader.compose_spatial_tiles(self.settings['tile_path'])
                 return composite_arr, composite_metadata, output_filename
-                # utils.export_data(composite_arr, composite_metadata, self.output_path, output_filename)
 
             else:
                 for tile_path in self.settings['tile_path']:
-                    print(f"Reading tile {tile_path}...")
+                    print(f"Reading tile {os.path.basename(os.path.normpath(tile_path))}...")
                     reader = s2_reader.S2Reader(tile_path=tile_path, bands=self.settings['bands'], roi_lat_lon=self.settings['roi_lat_lon'], 
                                                 roi_window=self.settings['roi_window'], atcor=self.settings['atcor'])
                     band_data, metadata, output_filename = reader.read_bands()
-                    return band_data, metadata, output_filename
-                    # utils.export_data(band_data, metadata, self.output_path, output_filename)
+                    utils.export_data(band_data, metadata, self.settings['output_dir'], output_filename)
         else:
                 raise ValueError("❌ Invalid 'tile path'. Please provide a string or a list of strings.")
